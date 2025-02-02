@@ -3,7 +3,7 @@ use regex_syntax::ParserBuilder;
 
 /// Determine if a regex pattern contains a literal uppercase character.
 pub fn pattern_has_uppercase_char(pattern: &str) -> bool {
-    let mut parser = ParserBuilder::new().allow_invalid_utf8(true).build();
+    let mut parser = ParserBuilder::new().utf8(false).build();
 
     parser
         .parse(pattern)
@@ -15,19 +15,21 @@ pub fn pattern_has_uppercase_char(pattern: &str) -> bool {
 fn hir_has_uppercase_char(hir: &Hir) -> bool {
     use regex_syntax::hir::*;
 
-    match *hir.kind() {
-        HirKind::Literal(Literal::Unicode(c)) => c.is_uppercase(),
-        HirKind::Literal(Literal::Byte(b)) => char::from(b).is_uppercase(),
-        HirKind::Class(Class::Unicode(ref ranges)) => ranges
+    match hir.kind() {
+        HirKind::Literal(Literal(bytes)) => match std::str::from_utf8(bytes) {
+            Ok(s) => s.chars().any(|c| c.is_uppercase()),
+            Err(_) => bytes.iter().any(|b| char::from(*b).is_uppercase()),
+        },
+        HirKind::Class(Class::Unicode(ranges)) => ranges
             .iter()
             .any(|r| r.start().is_uppercase() || r.end().is_uppercase()),
-        HirKind::Class(Class::Bytes(ref ranges)) => ranges
+        HirKind::Class(Class::Bytes(ranges)) => ranges
             .iter()
             .any(|r| char::from(r.start()).is_uppercase() || char::from(r.end()).is_uppercase()),
-        HirKind::Group(Group { ref hir, .. }) | HirKind::Repetition(Repetition { ref hir, .. }) => {
-            hir_has_uppercase_char(hir)
+        HirKind::Capture(Capture { sub, .. }) | HirKind::Repetition(Repetition { sub, .. }) => {
+            hir_has_uppercase_char(sub)
         }
-        HirKind::Concat(ref hirs) | HirKind::Alternation(ref hirs) => {
+        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
             hirs.iter().any(hir_has_uppercase_char)
         }
         _ => false,
@@ -36,7 +38,7 @@ fn hir_has_uppercase_char(hir: &Hir) -> bool {
 
 /// Determine if a regex pattern only matches strings starting with a literal dot (hidden files)
 pub fn pattern_matches_strings_with_leading_dot(pattern: &str) -> bool {
-    let mut parser = ParserBuilder::new().allow_invalid_utf8(true).build();
+    let mut parser = ParserBuilder::new().utf8(false).build();
 
     parser
         .parse(pattern)
@@ -52,11 +54,11 @@ fn hir_matches_strings_with_leading_dot(hir: &Hir) -> bool {
     // "^\\.", i.e. a start text anchor and a literal dot character. There are a lot
     // of other patterns that ONLY match hidden files, e.g. ^(\\.foo|\\.bar) which are
     // not (yet) detected by this algorithm.
-    match *hir.kind() {
-        HirKind::Concat(ref hirs) => {
+    match hir.kind() {
+        HirKind::Concat(hirs) => {
             let mut hirs = hirs.iter();
             if let Some(hir) = hirs.next() {
-                if *hir.kind() != HirKind::Anchor(Anchor::StartText) {
+                if hir.kind() != &HirKind::Look(Look::Start) {
                     return false;
                 }
             } else {
@@ -64,7 +66,10 @@ fn hir_matches_strings_with_leading_dot(hir: &Hir) -> bool {
             }
 
             if let Some(hir) = hirs.next() {
-                *hir.kind() == HirKind::Literal(Literal::Unicode('.'))
+                match hir.kind() {
+                    HirKind::Literal(Literal(bytes)) => bytes.starts_with(b"."),
+                    _ => false,
+                }
             } else {
                 false
             }

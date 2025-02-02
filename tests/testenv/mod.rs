@@ -8,7 +8,7 @@ use std::os::windows;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 /// Environment for the integration tests.
 pub struct TestEnv {
@@ -20,6 +20,9 @@ pub struct TestEnv {
 
     /// Normalize each line by sorting the whitespace-separated words
     normalize_line: bool,
+
+    /// Temporary directory for storing test config (global ignore file)
+    config_dir: Option<TempDir>,
 }
 
 /// Create the working directory and the test files.
@@ -27,7 +30,7 @@ fn create_working_directory(
     directories: &[&'static str],
     files: &[&'static str],
 ) -> Result<TempDir, io::Error> {
-    let temp_dir = TempDir::new("fd-tests")?;
+    let temp_dir = tempfile::Builder::new().prefix("fd-tests").tempdir()?;
 
     {
         let root = temp_dir.path();
@@ -57,6 +60,16 @@ fn create_working_directory(
     }
 
     Ok(temp_dir)
+}
+
+fn create_config_directory_with_global_ignore(ignore_file_content: &str) -> io::Result<TempDir> {
+    let config_dir = tempfile::Builder::new().prefix("fd-config").tempdir()?;
+    let fd_dir = config_dir.path().join("fd");
+    fs::create_dir(&fd_dir)?;
+    let mut ignore_file = fs::File::create(fd_dir.join("ignore"))?;
+    ignore_file.write_all(ignore_file_content.as_bytes())?;
+
+    Ok(config_dir)
 }
 
 /// Find the *fd* executable.
@@ -91,9 +104,9 @@ fn format_output_error(args: &[&str], expected: &str, actual: &str) -> String {
     let diff_text = diff::lines(expected, actual)
         .into_iter()
         .map(|diff| match diff {
-            diff::Result::Left(l) => format!("-{}", l),
-            diff::Result::Both(l, _) => format!(" {}", l),
-            diff::Result::Right(r) => format!("+{}", r),
+            diff::Result::Left(l) => format!("-{l}"),
+            diff::Result::Both(l, _) => format!(" {l}"),
+            diff::Result::Right(r) => format!("+{r}"),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -116,7 +129,7 @@ fn normalize_output(s: &str, trim_start: bool, normalize_line: bool) -> String {
         .lines()
         .map(|line| {
             let line = if trim_start { line.trim_start() } else { line };
-            let line = line.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+            let line = line.replace('/', std::path::MAIN_SEPARATOR_STR);
             if normalize_line {
                 let mut words: Vec<_> = line.split_whitespace().collect();
                 words.sort_unstable();
@@ -130,6 +143,17 @@ fn normalize_output(s: &str, trim_start: bool, normalize_line: bool) -> String {
     lines.join("\n")
 }
 
+/// Trim whitespace from the beginning of each line.
+fn trim_lines(s: &str) -> String {
+    s.lines()
+        .map(|line| line.trim_start())
+        .fold(String::new(), |mut str, line| {
+            str.push_str(line);
+            str.push('\n');
+            str
+        })
+}
+
 impl TestEnv {
     pub fn new(directories: &[&'static str], files: &[&'static str]) -> TestEnv {
         let temp_dir = create_working_directory(directories, files).expect("working directory");
@@ -139,6 +163,7 @@ impl TestEnv {
             temp_dir,
             fd_exe,
             normalize_line: false,
+            config_dir: None,
         }
     }
 
@@ -147,6 +172,16 @@ impl TestEnv {
             temp_dir: self.temp_dir,
             fd_exe: self.fd_exe,
             normalize_line: normalize,
+            config_dir: self.config_dir,
+        }
+    }
+
+    pub fn global_ignore_file(self, content: &str) -> TestEnv {
+        let config_dir =
+            create_config_directory_with_global_ignore(content).expect("config directory");
+        TestEnv {
+            config_dir: Some(config_dir),
+            ..self
         }
     }
 
@@ -158,7 +193,9 @@ impl TestEnv {
         let root = self.test_root();
         let broken_symlink_link = root.join(link_path);
         {
-            let temp_target_dir = TempDir::new("fd-tests-broken-symlink")?;
+            let temp_target_dir = tempfile::Builder::new()
+                .prefix("fd-tests-broken-symlink")
+                .tempdir()?;
             let broken_symlink_target = temp_target_dir.path().join("broken_symlink_target");
             fs::File::create(&broken_symlink_target)?;
             #[cfg(unix)]
@@ -174,6 +211,12 @@ impl TestEnv {
         self.temp_dir.path().to_path_buf()
     }
 
+    /// Get the path of the fd executable.
+    #[cfg_attr(windows, allow(unused))]
+    pub fn test_exe(&self) -> &PathBuf {
+        &self.fd_exe
+    }
+
     /// Get the root directory of the file system.
     pub fn system_root(&self) -> PathBuf {
         let mut components = self.temp_dir.path().components();
@@ -187,13 +230,8 @@ impl TestEnv {
         path: P,
         args: &[&str],
     ) -> process::Output {
-        // Setup *fd* command.
-        let mut cmd = process::Command::new(&self.fd_exe);
-        cmd.current_dir(self.temp_dir.path().join(path));
-        cmd.arg("--no-global-ignore-file").args(args);
-
         // Run *fd*.
-        let output = cmd.output().expect("fd output");
+        let output = self.run_command(path.as_ref(), args);
 
         // Check for exit status.
         if !output.status.success() {
@@ -201,6 +239,19 @@ impl TestEnv {
         }
 
         output
+    }
+
+    pub fn assert_success_and_get_normalized_output<P: AsRef<Path>>(
+        &self,
+        path: P,
+        args: &[&str],
+    ) -> String {
+        let output = self.assert_success_and_get_output(path, args);
+        normalize_output(
+            &String::from_utf8_lossy(&output.stdout),
+            false,
+            self.normalize_line,
+        )
     }
 
     /// Assert that calling *fd* with the specified arguments produces the expected output.
@@ -224,15 +275,9 @@ impl TestEnv {
         args: &[&str],
         expected: &str,
     ) {
-        let output = self.assert_success_and_get_output(path, args);
-
         // Normalize both expected and actual output.
         let expected = normalize_output(expected, true, self.normalize_line);
-        let actual = normalize_output(
-            &String::from_utf8_lossy(&output.stdout),
-            false,
-            self.normalize_line,
-        );
+        let actual = self.assert_success_and_get_normalized_output(path, args);
 
         // Compare actual output to expected output.
         if expected != actual {
@@ -245,7 +290,7 @@ impl TestEnv {
     pub fn assert_failure_with_error(&self, args: &[&str], expected: &str) {
         let status = self.assert_error_subdirectory(".", args, Some(expected));
         if status.success() {
-            panic!("error '{}' did not occur.", expected);
+            panic!("error '{expected}' did not occur.");
         }
     }
 
@@ -262,6 +307,24 @@ impl TestEnv {
         self.assert_error_subdirectory(".", args, Some(expected))
     }
 
+    fn run_command(&self, path: &Path, args: &[&str]) -> process::Output {
+        // Setup *fd* command.
+        let mut cmd = process::Command::new(&self.fd_exe);
+        cmd.current_dir(self.temp_dir.path().join(path));
+        if let Some(config_dir) = &self.config_dir {
+            cmd.env("XDG_CONFIG_HOME", config_dir.path());
+        } else {
+            cmd.arg("--no-global-ignore-file");
+        }
+        // Make sure LS_COLORS is unset to ensure consistent
+        // color output
+        cmd.env("LS_COLORS", "");
+        cmd.args(args);
+
+        // Run *fd*.
+        cmd.output().expect("fd output")
+    }
+
     /// Assert that calling *fd* in the specified path under the root working directory,
     /// and with the specified arguments produces an error with the expected message.
     fn assert_error_subdirectory<P: AsRef<Path>>(
@@ -270,22 +333,12 @@ impl TestEnv {
         args: &[&str],
         expected: Option<&str>,
     ) -> process::ExitStatus {
-        // Setup *fd* command.
-        let mut cmd = process::Command::new(&self.fd_exe);
-        cmd.current_dir(self.temp_dir.path().join(path));
-        cmd.arg("--no-global-ignore-file").args(args);
-
-        // Run *fd*.
-        let output = cmd.output().expect("fd output");
+        let output = self.run_command(path.as_ref(), args);
 
         if let Some(expected) = expected {
             // Normalize both expected and actual output.
-            let expected_error = normalize_output(expected, true, self.normalize_line);
-            let actual_err = normalize_output(
-                &String::from_utf8_lossy(&output.stderr),
-                false,
-                self.normalize_line,
-            );
+            let expected_error = trim_lines(expected);
+            let actual_err = trim_lines(&String::from_utf8_lossy(&output.stderr));
 
             // Compare actual output to expected output.
             if !actual_err.trim_start().starts_with(&expected_error) {

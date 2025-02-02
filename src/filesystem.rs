@@ -4,12 +4,12 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 #[cfg(any(unix, target_os = "redox"))]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use normpath::PathExt;
 
-use crate::walk;
+use crate::dir_entry;
 
 pub fn path_absolute_form(path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() {
@@ -41,17 +41,7 @@ pub fn is_existing_directory(path: &Path) -> bool {
     path.is_dir() && (path.file_name().is_some() || path.normalize().is_ok())
 }
 
-#[cfg(any(unix, target_os = "redox"))]
-pub fn is_executable(md: &fs::Metadata) -> bool {
-    md.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(windows)]
-pub fn is_executable(_: &fs::Metadata) -> bool {
-    false
-}
-
-pub fn is_empty(entry: &walk::DirEntry) -> bool {
+pub fn is_empty(entry: &dir_entry::DirEntry) -> bool {
     if let Some(file_type) = entry.file_type() {
         if file_type.is_dir() {
             if let Ok(mut entries) = fs::read_dir(entry.path()) {
@@ -67,6 +57,26 @@ pub fn is_empty(entry: &walk::DirEntry) -> bool {
     } else {
         false
     }
+}
+
+#[cfg(any(unix, target_os = "redox"))]
+pub fn is_block_device(ft: fs::FileType) -> bool {
+    ft.is_block_device()
+}
+
+#[cfg(windows)]
+pub fn is_block_device(_: fs::FileType) -> bool {
+    false
+}
+
+#[cfg(any(unix, target_os = "redox"))]
+pub fn is_char_device(ft: fs::FileType) -> bool {
+    ft.is_char_device()
+}
+
+#[cfg(windows)]
+pub fn is_char_device(_: fs::FileType) -> bool {
+    false
 }
 
 #[cfg(any(unix, target_os = "redox"))]
@@ -118,13 +128,11 @@ pub fn strip_current_dir(path: &Path) -> &Path {
 pub fn default_path_separator() -> Option<String> {
     if cfg!(windows) {
         let msystem = env::var("MSYSTEM").ok()?;
-        match msystem.as_str() {
-            "MINGW64" | "MINGW32" | "MSYS" => Some("/".to_owned()),
-            _ => None,
+        if !msystem.is_empty() {
+            return Some("/".to_owned());
         }
-    } else {
-        None
     }
+    None
 }
 
 #[cfg(test)]
